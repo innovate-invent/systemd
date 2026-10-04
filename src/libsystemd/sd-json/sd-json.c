@@ -14,11 +14,11 @@
 #include "ether-addr-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "float.h"
 #include "hexdecoct.h"
 #include "in-addr-util.h"
 #include "json-internal.h"
 #include "json-util.h"
+#include "locale-util.h"
 #include "log.h"
 #include "math-util.h"
 #include "memory-util.h"
@@ -1653,6 +1653,89 @@ static void json_format_string(FILE *f, const char *q, sd_json_format_flags_t fl
         fputc('"', f);
 }
 
+static bool json_real_bump(char *buf) {
+        /* Adds one unit in the last place to the mantissa of a "%e" rendering, away from zero.
+         * Returns false (leaving buf garbled) if that would carry into a new leading digit. */
+
+        for (char *q = ASSERT_PTR(strchr(buf, 'e')) - 1; q >= buf && *q != '-'; q--) {
+                if (*q == '.')
+                        continue;
+                if (*q < '9') {
+                        (*q)++;
+                        return true;
+                }
+                *q = '0';
+        }
+
+        return false;
+}
+
+static void json_format_real(FILE *f, double d) {
+        char buf[32], mantissa[18];
+        size_t n = 0;
+        int digits, exponent;
+        const char *e;
+
+        /* Writes d with the fewest significant digits that read back as exactly d, laid out as
+         * JavaScript and Python's repr() do: positional for decimal exponents -4 to 15, scientific
+         * otherwise, and always with a '.' or an exponent so that it is parsed back as a real. The
+         * output thus doesn't change when it is parsed and formatted again, and doesn't depend on
+         * the width of long double. Must be called with the C locale in effect for LC_NUMERIC. */
+
+        assert(f);
+        assert(isfinite(d));
+
+        /* 17 significant digits always identify a double uniquely. */
+        for (digits = 1;; digits++) {
+                double r;
+
+                assert_se(snprintf(buf, sizeof(buf), "%.*e", digits - 1, d) < (int) sizeof(buf));
+                if (digits >= 17)
+                        break;
+
+                r = strtod(buf, NULL);
+                if (fp_equal(r, d))
+                        break;
+
+                /* printf() picks the nearest decimal with this many digits. Just above a power of
+                 * two the doubles are twice as far apart as just below it, so the nearest decimal
+                 * may read back as the double below d while the next one up reads back as d. */
+                if (fabs(r) < fabs(d) && json_real_bump(buf) && fp_equal(strtod(buf, NULL), d))
+                        break;
+        }
+
+        e = ASSERT_PTR(strchr(buf, 'e'));
+        exponent = atoi(e + 1);
+
+        if (exponent < -4 || exponent >= 16) {
+                fputs(buf, f);
+                return;
+        }
+
+        for (const char *q = buf; q < e; q++)
+                if (ascii_isdigit(*q))
+                        mantissa[n++] = *q;
+        while (n > 1 && mantissa[n - 1] == '0')
+                n--;
+        mantissa[n] = 0;
+
+        if (signbit(d))
+                fputc('-', f);
+
+        if (exponent < 0) {
+                fputs("0.", f);
+                for (int i = -1; i > exponent; i--)
+                        fputc('0', f);
+                fputs(mantissa, f);
+        } else if (n <= (size_t) exponent + 1) {
+                fputs(mantissa, f);
+                for (size_t i = n; i <= (size_t) exponent; i++)
+                        fputc('0', f);
+                fputs(".0", f);
+        } else
+                fprintf(f, "%.*s.%s", exponent + 1, mantissa, mantissa + exponent + 1);
+}
+
 static int json_format(FILE *f, sd_json_variant *v, sd_json_format_flags_t flags, const char *prefix) {
         int r;
 
@@ -1681,7 +1764,7 @@ static int json_format(FILE *f, sd_json_variant *v, sd_json_format_flags_t flags
                         fputs(ansi_highlight_blue(), f);
 
                 old_loc = uselocale(loc);
-                fprintf(f, "%.*e", DECIMAL_DIG, sd_json_variant_real(v));
+                json_format_real(f, sd_json_variant_real(v));
                 uselocale(old_loc);
 
                 if (flags & SD_JSON_FORMAT_COLOR)
@@ -2708,8 +2791,7 @@ static int json_parse_string(const char **p, char **ret) {
 }
 
 static int json_parse_number(const char **p, JsonValue *ret) {
-        bool negative = false, exponent_negative = false, is_real = false;
-        double x = 0.0, y = 0.0, exponent = 0.0, shift = 1.0;
+        bool negative = false, is_real = false;
         int64_t i = 0;
         uint64_t u = 0;
         const char *c;
@@ -2759,8 +2841,6 @@ static int json_parse_number(const char **p, JsonValue *ret) {
                                 }
                         }
 
-                        x = 10.0 * x + (*c - '0');
-
                         c++;
                 } while (strchr(DIGITS, *c) && *c != 0);
         }
@@ -2772,42 +2852,51 @@ static int json_parse_number(const char **p, JsonValue *ret) {
                 if (!strchr(DIGITS, *c) || *c == 0)
                         return -EINVAL;
 
-                do {
-                        y = 10.0 * y + (*c - '0');
-                        shift = 10.0 * shift;
+                do
                         c++;
-                } while (strchr(DIGITS, *c) && *c != 0);
+                while (strchr(DIGITS, *c) && *c != 0);
         }
 
         if (IN_SET(*c, 'e', 'E')) {
                 is_real = true;
                 c++;
 
-                if (*c == '-') {
-                        exponent_negative = true;
-                        c++;
-                } else if (*c == '+')
+                if (IN_SET(*c, '-', '+'))
                         c++;
 
                 if (!strchr(DIGITS, *c) || *c == 0)
                         return -EINVAL;
 
-                do {
-                        exponent = 10.0 * exponent + (*c - '0');
+                do
                         c++;
-                } while (strchr(DIGITS, *c) && *c != 0);
+                while (strchr(DIGITS, *c) && *c != 0);
+        }
+
+        if (is_real) {
+                _cleanup_(freelocalep) locale_t loc = (locale_t) 0;
+                char *e;
+
+                /* Leave the conversion to strtod(): it rounds correctly, while accumulating the
+                 * digits in a double and scaling by a power of ten rounds several times and misses
+                 * by one ulp for many inputs (e.g. 1.14). The JSON number grammar checked above is a
+                 * subset of what strtod() accepts, so it must stop exactly where we did. Values
+                 * beyond the double range become ±HUGE_VAL, which sd_json_variant_new_real() turns
+                 * into null, as before. */
+                loc = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0);
+                if (loc == (locale_t) 0)
+                        return -errno;
+
+                ret->real = strtod_l(*p, &e, loc);
+                if (e != c)
+                        return -EINVAL;
+
+                *p = c;
+                return JSON_TOKEN_REAL;
         }
 
         *p = c;
 
-        if (is_real) {
-                /* Clamp before casting to int — a JSON input with an absurdly large exponent could
-                 * otherwise trigger undefined behaviour in the double→int conversion. xexp10i()
-                 * itself saturates anything beyond ~10^308, so clamping at INT_MAX is harmless. */
-                int e = exponent > (double) INT_MAX ? INT_MAX : (int) exponent;
-                ret->real = ((negative ? -1.0 : 1.0) * (x + (y / shift))) * xexp10i(exponent_negative ? -e : e);
-                return JSON_TOKEN_REAL;
-        } else if (negative) {
+        if (negative) {
                 ret->integer = i;
                 return JSON_TOKEN_INTEGER;
         } else  {

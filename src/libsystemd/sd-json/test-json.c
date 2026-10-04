@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <float.h>
+#include <locale.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
@@ -18,9 +19,11 @@
 #include "iovec-util.h"
 #include "json-internal.h"
 #include "json-util.h"
+#include "locale-util.h"
 #include "math-util.h"
 #include "ordered-set.h"
 #include "pidref.h"
+#include "random-util.h"
 #include "set.h"
 #include "string-table.h"
 #include "tests.h"
@@ -808,6 +811,80 @@ TEST(float) {
         sd_json_variant_dump(w, SD_JSON_FORMAT_COLOR|SD_JSON_FORMAT_PRETTY, NULL, NULL);
 
         test_float_match(w);
+}
+
+static void test_real_one(const char *in, const char *out) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_(freelocalep) locale_t loc = (locale_t) 0;
+        _cleanup_free_ char *text = NULL;
+        double d, e;
+
+        log_info("/* %s in=%s out=%s */", __func__, in, out);
+
+        /* Read exactly as strtod() reads it, written as Python's repr() writes it */
+        ASSERT_OK(sd_json_parse(in, 0, &v, NULL, NULL));
+        ASSERT_TRUE(sd_json_variant_is_real(v));
+        d = sd_json_variant_real(v);
+        ASSERT_NOT_NULL(loc = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0));
+        e = strtod_l(in, NULL, loc);    /* not safe_atod(), which refuses subnormals */
+        ASSERT_EQ(memcmp(&d, &e, sizeof(d)), 0);
+
+        ASSERT_OK(sd_json_variant_format(v, 0, &text));
+        ASSERT_STREQ(text, out);
+}
+
+TEST(real_exact) {
+        test_real_one("1.14", "1.14");
+        test_real_one("0.1", "0.1");
+        test_real_one("0.30000000000000004", "0.30000000000000004");
+        test_real_one("-2.5", "-2.5");
+        test_real_one("100.0", "100.0");
+        test_real_one("1e2", "100.0");
+        test_real_one("1E-5", "1e-05");
+        test_real_one("0.0001", "0.0001");
+        test_real_one("1e16", "1e+16");
+        test_real_one("123456789012345.6", "123456789012345.6");
+        test_real_one("18446744073709551616", "1.8446744073709552e+19");
+        test_real_one("1.7976931348623157e308", "1.7976931348623157e+308");
+        test_real_one("4.9e-324", "5e-324");
+        /* 2^-1017: the nearest 16-digit decimal reads back as the double below it */
+        test_real_one("7.120236347223045e-307", "7.120236347223045e-307");
+        /* What older versions wrote must still read back as the same double */
+        test_real_one("1.139999999999999902300e+00", "1.14");
+
+        /* The caller's locale changes neither direction */
+        _cleanup_free_ char *old = ASSERT_PTR(strdup(setlocale(LC_NUMERIC, NULL)));
+        if (setlocale(LC_NUMERIC, "de_DE.UTF-8")) {
+                test_real_one("1234.25", "1234.25");
+                test_real_one("0.5e-3", "0.0005");
+                ASSERT_NOT_NULL(setlocale(LC_NUMERIC, old));
+        } else
+                log_notice("de_DE.UTF-8 locale not available, skipping locale check.");
+}
+
+TEST(real_round_trip) {
+        for (unsigned i = 0; i < 100000; i++) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *w = NULL;
+                _cleanup_free_ char *text = NULL, *text2 = NULL;
+                uint64_t bits = random_u64();
+                double d, e;
+
+                memcpy(&d, &bits, sizeof(d));
+                if (!isfinite(d) || iszero_safe(d))
+                        continue;
+
+                ASSERT_OK(sd_json_variant_new_real(&v, d));
+                ASSERT_OK(sd_json_variant_format(v, 0, &text));
+                ASSERT_OK(sd_json_parse(text, 0, &w, NULL, NULL));
+                ASSERT_TRUE(sd_json_variant_is_real(w));
+                e = sd_json_variant_real(w);
+                if (memcmp(&d, &e, sizeof(d)) != 0)
+                        log_error("%a formatted as %s reads back as %a", d, text, e);
+                ASSERT_EQ(memcmp(&d, &e, sizeof(d)), 0);
+
+                ASSERT_OK(sd_json_variant_format(w, 0, &text2));
+                ASSERT_STREQ(text, text2);
+        }
 }
 
 static void test_equal_text(sd_json_variant *v, const char *text) {
