@@ -14,11 +14,11 @@
 #include "ether-addr-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "float.h"
 #include "hexdecoct.h"
 #include "in-addr-util.h"
 #include "json-internal.h"
 #include "json-util.h"
+#include "locale-util.h"
 #include "log.h"
 #include "math-util.h"
 #include "memory-util.h"
@@ -1680,8 +1680,18 @@ static int json_format(FILE *f, sd_json_variant *v, sd_json_format_flags_t flags
                 if (flags & SD_JSON_FORMAT_COLOR)
                         fputs(ansi_highlight_blue(), f);
 
+                /* The fewest significant digits that read back as the same double; 17 always do. */
                 old_loc = uselocale(loc);
-                fprintf(f, "%.*e", DECIMAL_DIG, sd_json_variant_real(v));
+                for (int digits = 1;; digits++) {
+                        double d = sd_json_variant_real(v);
+                        char buf[32];
+
+                        assert_se(snprintf(buf, sizeof(buf), "%.*g", digits, d) < (int) sizeof(buf));
+                        if (digits >= 17 || fp_equal(strtod(buf, NULL), d)) {
+                                fputs(buf, f);
+                                break;
+                        }
+                }
                 uselocale(old_loc);
 
                 if (flags & SD_JSON_FORMAT_COLOR)
@@ -2708,17 +2718,16 @@ static int json_parse_string(const char **p, char **ret) {
 }
 
 static int json_parse_number(const char **p, JsonValue *ret) {
-        bool negative = false, exponent_negative = false, is_real = false;
-        double x = 0.0, y = 0.0, exponent = 0.0, shift = 1.0;
+        bool negative = false, is_real = false;
         int64_t i = 0;
         uint64_t u = 0;
-        const char *c;
+        const char *c, *start;
 
         assert(p);
         assert(*p);
         assert(ret);
 
-        c = *p;
+        c = start = *p;
 
         if (*c == '-') {
                 negative = true;
@@ -2759,8 +2768,6 @@ static int json_parse_number(const char **p, JsonValue *ret) {
                                 }
                         }
 
-                        x = 10.0 * x + (*c - '0');
-
                         c++;
                 } while (strchr(DIGITS, *c) && *c != 0);
         }
@@ -2773,8 +2780,6 @@ static int json_parse_number(const char **p, JsonValue *ret) {
                         return -EINVAL;
 
                 do {
-                        y = 10.0 * y + (*c - '0');
-                        shift = 10.0 * shift;
                         c++;
                 } while (strchr(DIGITS, *c) && *c != 0);
         }
@@ -2783,17 +2788,13 @@ static int json_parse_number(const char **p, JsonValue *ret) {
                 is_real = true;
                 c++;
 
-                if (*c == '-') {
-                        exponent_negative = true;
-                        c++;
-                } else if (*c == '+')
+                if (IN_SET(*c, '-', '+'))
                         c++;
 
                 if (!strchr(DIGITS, *c) || *c == 0)
                         return -EINVAL;
 
                 do {
-                        exponent = 10.0 * exponent + (*c - '0');
                         c++;
                 } while (strchr(DIGITS, *c) && *c != 0);
         }
@@ -2801,11 +2802,19 @@ static int json_parse_number(const char **p, JsonValue *ret) {
         *p = c;
 
         if (is_real) {
-                /* Clamp before casting to int — a JSON input with an absurdly large exponent could
-                 * otherwise trigger undefined behaviour in the double→int conversion. xexp10i()
-                 * itself saturates anything beyond ~10^308, so clamping at INT_MAX is harmless. */
-                int e = exponent > (double) INT_MAX ? INT_MAX : (int) exponent;
-                ret->real = ((negative ? -1.0 : 1.0) * (x + (y / shift))) * xexp10i(exponent_negative ? -e : e);
+                _cleanup_(freelocalep) locale_t loc = (locale_t) 0;
+                char *e;
+
+                /* strtod() rounds correctly, unlike accumulating the digits in a double and scaling
+                 * by a power of ten. The grammar checked above is a subset of what it accepts. */
+                loc = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0);
+                if (loc == (locale_t) 0)
+                        return -errno;
+
+                ret->real = strtod_l(start, &e, loc);
+                if (e != c)
+                        return -EINVAL;
+
                 return JSON_TOKEN_REAL;
         } else if (negative) {
                 ret->integer = i;
